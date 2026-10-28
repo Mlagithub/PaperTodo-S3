@@ -1,0 +1,111 @@
+{
+  "kind": "native",
+  "id": "com.papertodo.plugin.minio",
+  "name": "MinIO 同步接力",
+  "description": "基于 MinIO / S3 兼容对象存储的便签、待办与笔记图片双向串行接力同步插件。",
+  "version": "1.0.0",
+  "apiVersion": "2.2",
+  "stateVersion": 1,
+  "entry": "PaperTodo.Plugin.MinioSync.dll",
+  "capabilities": [
+    "runtime"
+  ],
+  "advancedSettings": true,
+  "permissions": [
+    "papers.read",
+    "papers.observe",
+    "papers.create",
+    "papers.delete",
+    "todos.read",
+    "todos.observe",
+    "todos.append",
+    "todos.update",
+    "todos.delete",
+    "notes.read",
+    "notes.observe",
+    "notes.append",
+    "notes.replace"
+  ],
+  "settingCategories": [
+    {
+      "name": "连接配置",
+      "column": "left"
+    },
+    {
+      "name": "同步策略",
+      "column": "right"
+    }
+  ],
+  "startupPaper": {
+    "enabledSetting": "autoStart",
+    "instanceKey": "main",
+    "presentation": "hidden",
+    "title": "MinIO 同步接力"
+  },
+  "settings": [
+    {
+      "id": "autoStart",
+      "type": "boolean",
+      "name": "开机自动启用同步",
+      "description": "应用启动时自动在后台启用 MinIO 同步服务（以隐藏便签运行，不占用桌面），使顶栏同步图标常驻可用",
+      "default": true,
+      "category": "同步策略"
+    },
+    {
+      "id": "endpoint",
+      "type": "string",
+      "name": "MinIO / S3 Endpoint",
+      "description": "对象存储地址，如 http://192.168.8.4:9000 或 https://minio.keepone.work",
+      "default": "",
+      "category": "连接配置"
+    },
+    {
+      "id": "bucket",
+      "type": "string",
+      "name": "Bucket 存储桶",
+      "description": "用于存放同步数据的存储桶名称，如 papertodo",
+      "default": "papertodo",
+      "category": "连接配置"
+    },
+    {
+      "id": "prefix",
+      "type": "string",
+      "name": "存储前缀 (Prefix)",
+      "description": "存储路径前缀，默认 sync/，不同团队或场景可区分",
+      "default": "sync/",
+      "category": "连接配置"
+    },
+    {
+      "id": "accessKey",
+      "type": "string",
+      "name": "Access Key",
+      "description": "MinIO 或 S3 用户访问密钥",
+      "default": "",
+      "category": "连接配置"
+    },
+    {
+      "id": "secretKey",
+      "type": "string",
+      "name": "Secret Key",
+      "description": "MinIO 或 S3 用户秘密密钥",
+      "default": "",
+      "category": "连接配置"
+    },
+    {
+      "id": "insecureSkipVerify",
+      "type": "boolean",
+      "name": "允许不安全 SSL (自签名证书)",
+      "description": "针对自建内网 HTTPS 或自签名证书，忽略 SSL 证书链与主机名验证错误",
+      "default": false,
+      "category": "连接配置"
+    },
+    {
+      "id": "autoSync",
+      "type": "boolean",
+      "name": "空闲自动静默同步",
+      "description": "停止编辑 30 秒后自动静默推送到云端",
+      "default": true,
+      "category": "同步策略"
+    }
+  ]
+}
