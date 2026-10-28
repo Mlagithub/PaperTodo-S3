@@ -47,7 +47,24 @@ jobs:
         name: PaperTodo-S3-win-x64
         path: PaperTodo-S3-win-x64.zip
 
-    - name: Create GitHub Release
+    - name: Create or Update Latest Release
+      if: github.ref == 'refs/heads/main'
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: latest
+        name: PaperTodo-S3 (Latest Build)
+        prerelease: true
+        files: PaperTodo-S3-win-x64.zip
+        body: |
+          ### 🚀 PaperTodo-S3 最新自动构建版本
+
+          - **提交哈希**: `${{ github.sha }}`
+          - **构建环境**: Windows / .NET 10 (win-x64)
+          - **安装方式**: 下载附件中的 `PaperTodo-S3-win-x64.zip`，解压到 PaperTodo 安装目录下的 `plugins/` 文件夹中并重启 PaperTodo 即可。
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Create Tagged Release
       if: startsWith(github.ref, 'refs/tags/v')
       uses: softprops/action-gh-release@v2
       with:
