@@ -1,6 +1,6 @@
 # PaperTodo MinIO 同步插件 (MinioSync)
 
-基于 MinIO / S3 兼容对象存储的 PaperTodo 跨设备便签、待办与笔记图片双向串行接力同步插件。
+基于 MinIO / S3 兼容对象存储的 [PaperTodo](https://github.com/snownico0722/PaperTodo) 跨设备便签、待办与笔记图片双向串行接力同步插件。
 
 ## 功能特性
 

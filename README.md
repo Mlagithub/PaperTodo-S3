@@ -2,7 +2,7 @@
 
 [English](#features) | [简体中文](#功能特性)
 
-PaperTodo-S3 是专为桌面便签应用 [PaperTodo](https://github.com/keep-one/PaperTodo) 设计的跨设备双向同步插件，支持基于 MinIO、AWS S3、阿里云 OSS、Rust S3 等兼容 S3 协议的对象存储服务。
+PaperTodo-S3 是专为桌面便签应用 [PaperTodo](https://github.com/snownico0722/PaperTodo) 设计的跨设备双向同步插件，支持基于 MinIO、AWS S3、阿里云 OSS、Rust S3 等兼容 S3 协议的对象存储服务。
 
 ---
 
