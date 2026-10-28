@@ -28,6 +28,8 @@ public sealed class MinioSyncRuntime : IPaperPluginRuntime
 
         _debounceTimer = new Timer(OnDebounceElapsed, null, Timeout.Infinite, Timeout.Infinite);
 
+        MinioSyncPlugin.SyncTrigger = manual => TriggerSyncAsync(manual);
+
         // Register Global TopBar action
         _context.GlobalTopBar.SetActionHandler(OnTopBarAction);
         UpdateTopBarStatus(isSyncing: false, statusText: "MinIO 同步: 就绪 (点击立即同步)");
@@ -71,6 +73,7 @@ public sealed class MinioSyncRuntime : IPaperPluginRuntime
 
         _context.GlobalTopBar.SetActionHandler(null);
         _context.GlobalTopBar.Clear();
+        MinioSyncPlugin.SyncTrigger = null;
 
         // If there are pending changes on exit, attempt a final quick sync
         if (_hasPendingChanges && _settings.ToS3Config().IsValid)
@@ -155,7 +158,8 @@ public sealed class MinioSyncRuntime : IPaperPluginRuntime
                 _state = _state with
                 {
                     LastSyncTime = DateTimeOffset.UtcNow,
-                    KnownLocalHashes = hashes
+                    KnownLocalHashes = hashes,
+                    LastKnownRevision = result.NewRevision > 0 ? result.NewRevision : _state.LastKnownRevision
                 };
                 _context.State.Save(_state.ToJson());
 

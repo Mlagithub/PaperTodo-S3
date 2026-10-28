@@ -1,3 +1,4 @@
+using System.IO;
 using System.Net;
 using System.Net.Http;
 using System.Text;
@@ -22,6 +23,8 @@ internal static class Program
             ("s3-client-mock-operations", MockClientOperations),
             ("manifest-and-sync-data-hash-and-serialization", ManifestSerializationChecks),
             ("sync-engine-serial-relay-push-pull", SerialRelayPushPullChecks),
+            ("sync-engine-note-and-image-relay-push-pull", NoteAndImageSyncChecks),
+            ("sync-engine-deletion-push-pull", DeletionPushPullChecks),
             ("sync-engine-conflict-branch-isolation", ConflictBranchChecks)
         };
 
@@ -257,6 +260,28 @@ internal static class Program
         }
     }
 
+    private sealed class MockNoteAssets : IPaperNoteAssetsApi
+    {
+        private int _counter;
+        public Dictionary<string, (string Mime, byte[] Bytes)> Store { get; } = new(StringComparer.Ordinal);
+
+        public PaperNoteImage ReadImage(string paperId, string imageId)
+        {
+            if (Store.TryGetValue(imageId, out var val))
+            {
+                return new PaperNoteImage(imageId, val.Mime, val.Bytes);
+            }
+            throw new FileNotFoundException("Image not found: " + imageId);
+        }
+
+        public PaperNoteImage ImportImage(string paperId, string mime, byte[] bytes)
+        {
+            var id = $"img_{Interlocked.Increment(ref _counter):D8}";
+            Store[id] = (mime, bytes);
+            return new PaperNoteImage(id, mime, bytes);
+        }
+    }
+
     private sealed class MockWorkspace : IPaperTodoHostApi
     {
         public List<PaperSnapshot> Papers { get; } = new();
@@ -408,6 +433,144 @@ internal static class Program
         Assert(wsB.Papers.Count == 1, "Device B should have 1 paper.");
         Assert(wsB.Papers[0].Title == "设备A任务", $"Title mismatch on Device B: {wsB.Papers[0].Title}");
         Assert(wsB.Todos[wsB.Papers[0].Id][0].Text == "写代码", "Todo text mismatch on Device B.");
+    }
+
+    private static void NoteAndImageSyncChecks()
+    {
+        var s3Handler = new InMemoryS3Handler();
+        using var httpClient = new HttpClient(s3Handler);
+        var config = new S3Config
+        {
+            Endpoint = "http://127.0.0.1:9000",
+            Bucket = "papertodo",
+            Prefix = "sync/",
+            AccessKey = "ak",
+            SecretKey = "sk"
+        };
+
+        var clientA = new S3Client(config, httpClient);
+        var engineA = new SyncEngine(clientA, "sync/", "device-A", "PC-A");
+        var wsA = new MockWorkspace();
+        var assetsA = new MockNoteAssets();
+        var img1Bytes = new byte[] { 137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3, 4 };
+        var aImg1 = assetsA.ImportImage("note-1", "image/png", img1Bytes);
+
+        wsA.CreatePaper(new CreatePaperRequest
+        {
+            PaperId = "note-1",
+            Type = "note",
+            Title = "图文备忘",
+            Content = $"这是图片：![测试图](i:{aImg1.ImageId})"
+        });
+
+        var hashesA = new Dictionary<string, string>();
+        var resA = engineA.ExecuteSyncAsync(wsA, assetsA, 0, hashesA).GetAwaiter().GetResult();
+        Assert(resA.Success, $"Device A push failed: {resA.ErrorMessage}");
+        Assert(resA.PushedCount == 1, "Expected 1 note pushed from A.");
+
+        // Device B pulls the note and its image
+        var clientB = new S3Client(config, httpClient);
+        var engineB = new SyncEngine(clientB, "sync/", "device-B", "PC-B");
+        var wsB = new MockWorkspace();
+        var assetsB = new MockNoteAssets();
+        var hashesB = new Dictionary<string, string>();
+
+        var resB = engineB.ExecuteSyncAsync(wsB, assetsB, 0, hashesB).GetAwaiter().GetResult();
+        Assert(resB.Success, $"Device B pull failed: {resB.ErrorMessage}");
+        Assert(resB.PulledCount == 1, "Expected 1 note pulled to B.");
+        Assert(wsB.Papers.Count == 1, "Device B should have 1 paper.");
+
+        var noteContentOnB = wsB.Notes["note-1"];
+        var bImageIds = ImageAssetSyncer.ExtractImageIds(noteContentOnB);
+        Assert(bImageIds.Count == 1, $"Expected 1 image reference on B, got {bImageIds.Count}");
+
+        var bImg = assetsB.ReadImage("note-1", bImageIds[0]);
+        Assert(bImg.Bytes.SequenceEqual(img1Bytes), "Downloaded image bytes on B mismatch.");
+
+        // Idle sync on Device B: must NOT re-push or trigger infinite ping-pong loop!
+        var idleB = engineB.ExecuteSyncAsync(wsB, assetsB, resB.NewRevision, hashesB).GetAwaiter().GetResult();
+        Assert(idleB.Success, "Idle sync on B failed.");
+        Assert(idleB.PushedCount == 0, $"Idle sync on B should push 0 papers, but pushed {idleB.PushedCount}");
+        Assert(idleB.PulledCount == 0, "Idle sync on B should pull 0 papers.");
+
+        // Device A updates the note with a second image
+        var img2Bytes = new byte[] { 137, 80, 78, 71, 13, 10, 26, 10, 5, 6, 7, 8 };
+        var aImg2 = assetsA.ImportImage("note-1", "image/png", img2Bytes);
+        wsA.WriteNote(new WriteNoteRequest
+        {
+            PaperId = "note-1",
+            Content = $"图1: ![p1](i:{aImg1.ImageId}) 图2: ![p2](i:{aImg2.ImageId})"
+        });
+
+        var updateA = engineA.ExecuteSyncAsync(wsA, assetsA, resA.NewRevision, hashesA).GetAwaiter().GetResult();
+        Assert(updateA.Success, "Device A note update push failed.");
+        Assert(updateA.PushedCount == 1, "Expected 1 paper update pushed from A.");
+
+        // Device B pulls the updated note and imports the second image
+        var updateB = engineB.ExecuteSyncAsync(wsB, assetsB, updateA.NewRevision, hashesB).GetAwaiter().GetResult();
+        Assert(updateB.Success, "Device B update pull failed.");
+        Assert(updateB.PulledCount == 1, "Expected 1 paper update pulled to B.");
+
+        var updatedContentOnB = wsB.Notes["note-1"];
+        var updatedBImageIds = ImageAssetSyncer.ExtractImageIds(updatedContentOnB);
+        Assert(updatedBImageIds.Count == 2, $"Expected 2 images on B after update, got {updatedBImageIds.Count}");
+
+        var secondImgOnB = assetsB.ReadImage("note-1", updatedBImageIds[1]);
+        Assert(secondImgOnB.Bytes.SequenceEqual(img2Bytes), "Second image bytes on B mismatch.");
+    }
+
+    private static void DeletionPushPullChecks()
+    {
+        var s3Handler = new InMemoryS3Handler();
+        using var httpClient = new HttpClient(s3Handler);
+        var config = new S3Config
+        {
+            Endpoint = "http://127.0.0.1:9000",
+            Bucket = "papertodo",
+            Prefix = "sync/",
+            AccessKey = "ak",
+            SecretKey = "sk"
+        };
+
+        var clientA = new S3Client(config, httpClient);
+        var engineA = new SyncEngine(clientA, "sync/", "device-A", "PC-A");
+        var wsA = new MockWorkspace();
+        wsA.CreatePaper(new CreatePaperRequest { PaperId = "p-1", Type = "todo", Title = "任务一" });
+        wsA.CreatePaper(new CreatePaperRequest { PaperId = "p-2", Type = "todo", Title = "任务二" });
+        var hashesA = new Dictionary<string, string>();
+
+        var resA = engineA.ExecuteSyncAsync(wsA, null, 0, hashesA).GetAwaiter().GetResult();
+        Assert(resA.Success && resA.PushedCount == 2, "A initial push failed.");
+
+        var clientB = new S3Client(config, httpClient);
+        var engineB = new SyncEngine(clientB, "sync/", "device-B", "PC-B");
+        var wsB = new MockWorkspace();
+        var hashesB = new Dictionary<string, string>();
+
+        var resB = engineB.ExecuteSyncAsync(wsB, null, 0, hashesB).GetAwaiter().GetResult();
+        Assert(resB.Success && resB.PulledCount == 2, "B initial pull failed.");
+        Assert(wsB.Papers.Count == 2, "B should have 2 papers.");
+
+        // 1. Device A deletes p-1 locally and pushes
+        wsA.DeletePaper("p-1");
+        var delPushA = engineA.ExecuteSyncAsync(wsA, null, resA.NewRevision, hashesA).GetAwaiter().GetResult();
+        Assert(delPushA.Success, "A delete sync failed.");
+
+        // 2. Device B syncs -> should delete p-1 locally
+        var delPullB = engineB.ExecuteSyncAsync(wsB, null, delPushA.NewRevision, hashesB).GetAwaiter().GetResult();
+        Assert(delPullB.Success, "B sync deletion failed.");
+        Assert(wsB.Papers.Count == 1, $"B should have 1 paper remaining, got {wsB.Papers.Count}");
+        Assert(wsB.Papers[0].Id == "p-2", "Remaining paper should be p-2.");
+
+        // 3. Device B deletes p-2 locally and syncs
+        wsB.DeletePaper("p-2");
+        var delPushB = engineB.ExecuteSyncAsync(wsB, null, delPullB.NewRevision, hashesB).GetAwaiter().GetResult();
+        Assert(delPushB.Success, "B delete p-2 failed.");
+
+        // 4. Subsequent sync on Device B -> must NOT resurrect p-2!
+        var syncB2 = engineB.ExecuteSyncAsync(wsB, null, delPushB.NewRevision, hashesB).GetAwaiter().GetResult();
+        Assert(syncB2.Success, "B sync after delete failed.");
+        Assert(wsB.Papers.Count == 0, "B should have 0 papers and not resurrect deleted ones.");
     }
 
     private static void ConflictBranchChecks()

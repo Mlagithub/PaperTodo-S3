@@ -45,33 +45,57 @@ public sealed class ImageAssetSyncer
             $"${{1}}{newImageId}${{2}}");
     }
 
+    public static string ReplaceImageIds(string markdown, IReadOnlyDictionary<string, string> replacements)
+    {
+        if (string.IsNullOrWhiteSpace(markdown) || replacements == null || replacements.Count == 0)
+        {
+            return markdown;
+        }
+
+        return ImageRefRegex.Replace(markdown, match =>
+        {
+            if (match.Groups.Count >= 3)
+            {
+                var oldId = match.Groups[2].Value;
+                if (replacements.TryGetValue(oldId, out var newId))
+                {
+                    var label = match.Groups[1].Value;
+                    return $"![{label}](i:{newId})";
+                }
+            }
+            return match.Value;
+        });
+    }
+
     public async Task<IReadOnlyList<string>> EnsureAssetsUploadedAsync(
         IPaperNoteAssetsApi noteAssets,
         S3Client s3Client,
         string prefix,
         string paperId,
-        IEnumerable<string> imageIds,
+        Dictionary<string, string> assetHashes,
         CancellationToken ct = default)
     {
         var uploadedHashes = new List<string>();
-        foreach (var imageId in imageIds)
+        foreach (var (imageId, hash) in assetHashes)
         {
+            if (string.IsNullOrWhiteSpace(hash)) continue;
+
             try
             {
-                var image = noteAssets.ReadImage(paperId, imageId);
-                if (image == null || image.Bytes == null || image.Bytes.Length == 0)
-                {
-                    continue;
-                }
-
-                var hash = S3Signer.HashHex(image.Bytes);
-                uploadedHashes.Add(hash);
-
                 var assetKey = $"{prefix}v1/assets/{hash}.bin";
                 var exists = await s3Client.HeadObjectAsync(assetKey, ct).ConfigureAwait(false);
                 if (!exists)
                 {
-                    await s3Client.PutObjectAsync(assetKey, image.Bytes, image.Mime, ct).ConfigureAwait(false);
+                    var image = noteAssets.ReadImage(paperId, imageId);
+                    if (image?.Bytes != null && image.Bytes.Length > 0)
+                    {
+                        await s3Client.PutObjectAsync(assetKey, image.Bytes, image.Mime, ct).ConfigureAwait(false);
+                        uploadedHashes.Add(hash);
+                    }
+                }
+                else
+                {
+                    uploadedHashes.Add(hash);
                 }
             }
             catch

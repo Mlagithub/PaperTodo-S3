@@ -7,6 +7,8 @@ namespace PaperTodo.Plugin.MinioSync;
 
 public sealed class MinioSyncPlugin : IPaperBodyPlugin, IPaperPluginRuntimeProvider
 {
+    internal static Func<bool, Task<Engine.SyncResult>>? SyncTrigger { get; set; }
+
     public IPaperBodySession Create(PaperBodyContext context) =>
         new MinioSyncSession(context);
 
@@ -49,9 +51,27 @@ public sealed class MinioSyncPlugin : IPaperBodyPlugin, IPaperPluginRuntimeProvi
                 Padding = new Thickness(16, 8, 16, 8),
                 HorizontalAlignment = HorizontalAlignment.Left
             };
-            _syncButton.Click += (_, _) =>
+            _syncButton.Click += async (_, _) =>
             {
-                _statusText.Text = "已发起手动同步请求，请关注顶栏图标状态。";
+                if (SyncTrigger != null)
+                {
+                    _statusText.Text = "正在执行同步，请稍候...";
+                    try
+                    {
+                        var res = await SyncTrigger(true).ConfigureAwait(true);
+                        _statusText.Text = res.Success
+                            ? $"同步成功 (推:{res.PushedCount} 拉:{res.PulledCount})，顶栏状态已更新。"
+                            : $"同步失败: {res.ErrorMessage}";
+                    }
+                    catch (Exception ex)
+                    {
+                        _statusText.Text = $"同步异常: {ex.Message}";
+                    }
+                }
+                else
+                {
+                    _statusText.Text = "同步后台服务未就绪，请在设置中开启并填写配置。";
+                }
             };
             Grid.SetRow(_syncButton, 1);
 

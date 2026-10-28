@@ -109,6 +109,9 @@ public sealed record PaperSyncData
     [JsonPropertyName("referencedAssets")]
     public IReadOnlyList<string> ReferencedAssets { get; init; } = Array.Empty<string>();
 
+    [JsonPropertyName("assetHashes")]
+    public Dictionary<string, string> AssetHashes { get; init; } = new(StringComparer.Ordinal);
+
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,
@@ -147,7 +150,10 @@ public sealed record PaperSyncData
         }
         else
         {
-            sb.Append(NoteContent);
+            var normalizedContent = AssetHashes.Count > 0
+                ? ImageAssetSyncer.ReplaceImageIds(NoteContent, AssetHashes)
+                : NoteContent;
+            sb.Append(normalizedContent);
             foreach (var asset in ReferencedAssets.OrderBy(a => a, StringComparer.Ordinal))
             {
                 sb.Append('#').Append(asset);

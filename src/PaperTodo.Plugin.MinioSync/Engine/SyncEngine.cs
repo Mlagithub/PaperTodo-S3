@@ -9,6 +9,7 @@ public sealed record SyncResult
     public int PulledCount { get; init; }
     public int PushedCount { get; init; }
     public int ConflictCount { get; init; }
+    public long NewRevision { get; init; }
     public string? ErrorMessage { get; init; }
     public DateTimeOffset SyncedAt { get; init; } = DateTimeOffset.UtcNow;
 }
@@ -56,7 +57,7 @@ public sealed class SyncEngine
 
             foreach (var paper in localPapers)
             {
-                var syncData = CapturePaperData(workspace, paper);
+                var syncData = CapturePaperData(workspace, noteAssets, paper);
                 currentLocalData[paper.Id] = syncData;
                 currentLocalHashes[paper.Id] = syncData.ComputeContentHash();
             }
@@ -67,10 +68,15 @@ public sealed class SyncEngine
             {
                 foreach (var (remoteId, remoteSummary) in remoteManifest.Papers)
                 {
-                    targetManifestPapers[remoteId] = remoteSummary;
-
                     if (!currentLocalData.TryGetValue(remoteId, out var localData))
                     {
+                        // Check if this paper was previously known and deleted locally
+                        if (knownLocalHashes.ContainsKey(remoteId))
+                        {
+                            // Local deletion: do not resurrect, push step will update remote manifest
+                            continue;
+                        }
+
                         // New paper from remote -> Pull and create
                         var remotePaperBytes = await _s3Client.GetObjectAsync($"{_prefix}v1/papers/{remoteId}.json", ct).ConfigureAwait(false);
                         if (remotePaperBytes != null && PaperSyncData.FromUtf8Bytes(remotePaperBytes) is { } remoteData)
@@ -78,9 +84,11 @@ public sealed class SyncEngine
                             await ApplyRemotePaperAsync(workspace, noteAssets, remoteData, isConflict: false, ct).ConfigureAwait(false);
                             pulledCount++;
                         }
+                        targetManifestPapers[remoteId] = remoteSummary;
                     }
                     else
                     {
+                        targetManifestPapers[remoteId] = remoteSummary;
                         var localHash = currentLocalHashes[remoteId];
                         if (string.Equals(localHash, remoteSummary.ContentHash, StringComparison.Ordinal))
                         {
@@ -127,6 +135,31 @@ public sealed class SyncEngine
                         }
                     }
                 }
+
+                // Check for papers deleted on REMOTE:
+                // Papers that exist locally and in knownLocalHashes, but NOT in remoteManifest.Papers
+                foreach (var (localId, localData) in currentLocalData.ToArray())
+                {
+                    if (knownLocalHashes.TryGetValue(localId, out var lastKnownHash) &&
+                        !remoteManifest.Papers.ContainsKey(localId))
+                    {
+                        var localHash = currentLocalHashes[localId];
+                        var localModified = !string.Equals(localHash, lastKnownHash, StringComparison.Ordinal);
+                        if (!localModified)
+                        {
+                            // Remote deleted it and local hasn't modified it -> Delete locally
+                            try
+                            {
+                                workspace.DeletePaper(localId);
+                                currentLocalData.Remove(localId);
+                                currentLocalHashes.Remove(localId);
+                                knownLocalHashes.Remove(localId);
+                                pulledCount++;
+                            }
+                            catch { }
+                        }
+                    }
+                }
             }
 
             // 3. Refresh local snapshot after pulls/conflicts
@@ -135,9 +168,18 @@ public sealed class SyncEngine
             currentLocalHashes.Clear();
             foreach (var paper in localPapers)
             {
-                var syncData = CapturePaperData(workspace, paper);
+                var syncData = CapturePaperData(workspace, noteAssets, paper);
                 currentLocalData[paper.Id] = syncData;
                 currentLocalHashes[paper.Id] = syncData.ComputeContentHash();
+            }
+
+            // Clean knownLocalHashes of deleted papers
+            foreach (var id in knownLocalHashes.Keys.ToArray())
+            {
+                if (!currentLocalData.ContainsKey(id))
+                {
+                    knownLocalHashes.Remove(id);
+                }
             }
 
             // 4. Push local changes
@@ -154,10 +196,10 @@ public sealed class SyncEngine
                 if (!remoteHasSame)
                 {
                     // Upload referenced images if Note
-                    if (localData.Type == "note" && noteAssets != null && localData.ReferencedAssets.Count > 0)
+                    if (localData.Type == "note" && noteAssets != null && localData.AssetHashes.Count > 0)
                     {
                         await _imageSyncer.EnsureAssetsUploadedAsync(
-                            noteAssets, _s3Client, _prefix, paperId, localData.ReferencedAssets, ct).ConfigureAwait(false);
+                            noteAssets, _s3Client, _prefix, paperId, localData.AssetHashes, ct).ConfigureAwait(false);
                     }
 
                     // Upload paper JSON
@@ -176,14 +218,31 @@ public sealed class SyncEngine
                 };
             }
 
+            // Clean up S3 paper files for deleted papers
+            if (remoteManifest != null)
+            {
+                foreach (var remoteId in remoteManifest.Papers.Keys)
+                {
+                    if (!currentLocalData.ContainsKey(remoteId))
+                    {
+                        try
+                        {
+                            await _s3Client.DeleteObjectAsync($"{_prefix}v1/papers/{remoteId}.json", ct).ConfigureAwait(false);
+                        }
+                        catch { }
+                    }
+                }
+            }
+
             // 5. Update remote manifest ONLY IF we actually pushed something, had deletions, or had conflicts to record
+            long finalRevision = remoteManifest?.SyncRevision ?? 0;
             if (pushedCount > 0 || hasLocalDeletions || conflictCount > 0 || remoteManifest == null)
             {
-                var newRevision = (remoteManifest?.SyncRevision ?? 0) + 1;
+                finalRevision = (remoteManifest?.SyncRevision ?? 0) + 1;
                 var newManifest = new SyncManifest
                 {
                     SchemaVersion = 1,
-                    SyncRevision = newRevision,
+                    SyncRevision = finalRevision,
                     LastDeviceId = _deviceId,
                     LastDeviceName = _deviceName,
                     UpdatedAt = DateTimeOffset.UtcNow,
@@ -194,7 +253,6 @@ public sealed class SyncEngine
             }
 
             // Update known hashes tracking
-            knownLocalHashes.Clear();
             foreach (var (k, v) in currentLocalHashes)
             {
                 knownLocalHashes[k] = v;
@@ -205,7 +263,8 @@ public sealed class SyncEngine
                 Success = true,
                 PulledCount = pulledCount,
                 PushedCount = pushedCount,
-                ConflictCount = conflictCount
+                ConflictCount = conflictCount,
+                NewRevision = finalRevision
             };
         }
         catch (Exception ex)
@@ -218,11 +277,15 @@ public sealed class SyncEngine
         }
     }
 
-    private static PaperSyncData CapturePaperData(IPaperTodoHostApi workspace, PaperSnapshot paper)
+    private static PaperSyncData CapturePaperData(
+        IPaperTodoHostApi workspace,
+        IPaperNoteAssetsApi? noteAssets,
+        PaperSnapshot paper)
     {
         var todos = new List<TodoItemSyncData>();
         var noteContent = "";
         var referencedAssets = new List<string>();
+        var assetHashes = new Dictionary<string, string>(StringComparer.Ordinal);
 
         if (paper.Type == "todo")
         {
@@ -246,7 +309,30 @@ public sealed class SyncEngine
             if (note != null && note.ContentAvailable)
             {
                 noteContent = note.Content ?? "";
-                referencedAssets.AddRange(ImageAssetSyncer.ExtractImageIds(noteContent));
+                var imgIds = ImageAssetSyncer.ExtractImageIds(noteContent);
+                foreach (var imgId in imgIds)
+                {
+                    if (noteAssets != null)
+                    {
+                        try
+                        {
+                            var img = noteAssets.ReadImage(paper.Id, imgId);
+                            if (img?.Bytes != null && img.Bytes.Length > 0)
+                            {
+                                var hash = S3Signer.HashHex(img.Bytes);
+                                assetHashes[imgId] = hash;
+                                if (!referencedAssets.Contains(hash, StringComparer.Ordinal))
+                                {
+                                    referencedAssets.Add(hash);
+                                }
+                            }
+                        }
+                        catch
+                        {
+                            // If image is unreadable, keep tracking id
+                        }
+                    }
+                }
             }
         }
 
@@ -258,8 +344,44 @@ public sealed class SyncEngine
             Todos = todos,
             NoteContent = noteContent,
             UpdatedAt = DateTimeOffset.UtcNow,
-            ReferencedAssets = referencedAssets
+            ReferencedAssets = referencedAssets,
+            AssetHashes = assetHashes
         };
+    }
+
+    private async Task<string> ResolveRemoteNoteContentAsync(
+        IPaperNoteAssetsApi? noteAssets,
+        string targetPaperId,
+        PaperSyncData remoteData,
+        CancellationToken ct)
+    {
+        var content = remoteData.NoteContent;
+        if (noteAssets == null || remoteData.AssetHashes.Count == 0)
+        {
+            return content;
+        }
+
+        var replacements = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var (oldImageId, hash) in remoteData.AssetHashes)
+        {
+            if (string.IsNullOrWhiteSpace(hash)) continue;
+
+            var assetBytes = await _imageSyncer.DownloadAssetAsync(_s3Client, _prefix, hash, ct).ConfigureAwait(false);
+            if (assetBytes != null && assetBytes.Length > 0)
+            {
+                try
+                {
+                    var newImage = noteAssets.ImportImage(targetPaperId, "image/png", assetBytes);
+                    replacements[oldImageId] = newImage.ImageId;
+                }
+                catch
+                {
+                    // Keep original reference on import failure
+                }
+            }
+        }
+
+        return ImageAssetSyncer.ReplaceImageIds(content, replacements);
     }
 
     private async Task ApplyRemotePaperAsync(
@@ -300,27 +422,7 @@ public sealed class SyncEngine
             var result = workspace.CreatePaper(req);
             var noteId = result.PaperId;
 
-            // Handle imported images and rewrite markdown references
-            var adjustedContent = remoteData.NoteContent;
-            if (noteAssets != null && remoteData.ReferencedAssets.Count > 0)
-            {
-                foreach (var oldImageId in remoteData.ReferencedAssets)
-                {
-                    var assetBytes = await _imageSyncer.DownloadAssetAsync(_s3Client, _prefix, oldImageId, ct).ConfigureAwait(false);
-                    if (assetBytes != null && assetBytes.Length > 0)
-                    {
-                        try
-                        {
-                            var newImage = noteAssets.ImportImage(noteId, "image/png", assetBytes);
-                            adjustedContent = ImageAssetSyncer.ReplaceImageId(adjustedContent, oldImageId, newImage.ImageId);
-                        }
-                        catch
-                        {
-                            // Keep original reference on import failure
-                        }
-                    }
-                }
-            }
+            var adjustedContent = await ResolveRemoteNoteContentAsync(noteAssets, noteId, remoteData, ct).ConfigureAwait(false);
 
             workspace.WriteNote(new WriteNoteRequest
             {
@@ -331,7 +433,7 @@ public sealed class SyncEngine
         }
     }
 
-    private static async Task UpdateLocalPaperAsync(
+    private async Task UpdateLocalPaperAsync(
         IPaperTodoHostApi workspace,
         IPaperNoteAssetsApi? noteAssets,
         PaperSyncData localData,
@@ -372,10 +474,12 @@ public sealed class SyncEngine
         }
         else if (localData.Type == "note")
         {
+            var adjustedContent = await ResolveRemoteNoteContentAsync(noteAssets, localData.Id, remoteData, ct).ConfigureAwait(false);
+
             workspace.WriteNote(new WriteNoteRequest
             {
                 PaperId = localData.Id,
-                Content = remoteData.NoteContent,
+                Content = adjustedContent,
                 Mode = NoteWriteMode.Replace
             });
         }
