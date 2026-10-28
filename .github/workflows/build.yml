@@ -1,0 +1,57 @@
+name: Build and Package
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Setup .NET 10
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: "10.0.x"
+
+    - name: Run Unit Tests
+      shell: pwsh
+      run: |
+        dotnet run --project tests/PaperTodo.MinioSyncChecks/PaperTodo.MinioSyncChecks.csproj -c Release
+
+    - name: Publish Plugin
+      shell: pwsh
+      run: |
+        & ./scripts/build.ps1 -OutputDir dist/com.papertodo.plugin.minio
+
+    - name: Compress Plugin Package
+      shell: pwsh
+      run: |
+        Compress-Archive -Path dist/com.papertodo.plugin.minio -DestinationPath PaperTodo-S3-win-x64.zip -Force
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: PaperTodo-S3-win-x64
+        path: PaperTodo-S3-win-x64.zip
+
+    - name: Create GitHub Release
+      if: startsWith(github.ref, 'refs/tags/v')
+      uses: softprops/action-gh-release@v2
+      with:
+        files: PaperTodo-S3-win-x64.zip
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
