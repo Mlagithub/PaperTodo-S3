@@ -132,4 +132,39 @@ public sealed class S3Client : IDisposable
             response.EnsureSuccessStatusCode();
         }
     }
+
+    public async Task<IReadOnlyList<string>> ListObjectsAsync(string prefix = "", CancellationToken ct = default)
+    {
+        var baseUri = new Uri(_config.Endpoint.TrimEnd('/') + "/");
+        var bucket = Uri.EscapeDataString(_config.Bucket);
+        var normPrefix = (prefix ?? "").TrimStart('/');
+        var query = string.IsNullOrEmpty(normPrefix) ? "list-type=2" : $"list-type=2&prefix={Uri.EscapeDataString(normPrefix)}";
+        var uri = new Uri(baseUri, $"{bucket}?{query}");
+
+        using var request = new HttpRequestMessage(HttpMethod.Get, uri);
+        S3Signer.Sign(request, _config);
+
+        using var response = await _httpClient.SendAsync(request, ct).ConfigureAwait(false);
+        if (response.StatusCode == HttpStatusCode.NotFound)
+        {
+            return Array.Empty<string>();
+        }
+        response.EnsureSuccessStatusCode();
+
+        var xml = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        var keys = new List<string>();
+        try
+        {
+            var doc = System.Xml.Linq.XDocument.Parse(xml);
+            foreach (var node in doc.Descendants())
+            {
+                if (node.Name.LocalName == "Key" && !string.IsNullOrWhiteSpace(node.Value))
+                {
+                    keys.Add(node.Value);
+                }
+            }
+        }
+        catch { }
+        return keys;
+    }
 }

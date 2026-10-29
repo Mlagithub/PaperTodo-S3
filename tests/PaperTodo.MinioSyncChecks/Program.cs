@@ -29,7 +29,9 @@ internal static class Program
             ("sync-engine-deletion-push-pull", DeletionPushPullChecks),
             ("sync-engine-delete-conflict-preservation", DeleteConflictPreservationChecks),
             ("sync-engine-conflict-branch-isolation", ConflictBranchChecks),
-            ("asset-mime-detection-and-download-failure-abort", AssetMimeDetectionAndDownloadFailureAbortChecks)
+            ("asset-mime-detection-and-download-failure-abort", AssetMimeDetectionAndDownloadFailureAbortChecks),
+            ("s3-client-list-objects", S3ClientListObjectsChecks),
+            ("sync-engine-orphan-asset-garbage-collection", OrphanAssetGarbageCollectionChecks)
         };
 
         var failed = 0;
@@ -235,6 +237,37 @@ internal static class Program
 
             if (request.Method == HttpMethod.Get)
             {
+                if (request.RequestUri?.Query.Contains("list-type=2") == true)
+                {
+                    var prefixMatch = "";
+                    var queryPairs = (request.RequestUri.Query.TrimStart('?')).Split('&');
+                    foreach (var q in queryPairs)
+                    {
+                        var kv = q.Split('=', 2);
+                        if (kv[0] == "prefix" && kv.Length > 1)
+                        {
+                            prefixMatch = Uri.UnescapeDataString(kv[1]);
+                        }
+                    }
+
+                    var sb = new StringBuilder();
+                    sb.Append("<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
+                    foreach (var storedPath in Storage.Keys)
+                    {
+                        var pParts = storedPath.Split('/', 2, StringSplitOptions.RemoveEmptyEntries);
+                        var objKey = pParts.Length > 1 ? pParts[1] : "";
+                        if (string.IsNullOrEmpty(prefixMatch) || objKey.StartsWith(prefixMatch, StringComparison.Ordinal))
+                        {
+                            sb.Append("<Contents><Key>").Append(objKey).Append("</Key></Contents>");
+                        }
+                    }
+                    sb.Append("</ListBucketResult>");
+                    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        Content = new StringContent(sb.ToString(), Encoding.UTF8, "application/xml")
+                    });
+                }
+
                 if (Storage.TryGetValue(path, out var data))
                 {
                     return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
@@ -832,5 +865,96 @@ internal static class Program
         Assert(resB.ErrorMessage != null && resB.ErrorMessage.Contains("could not be downloaded"),
             $"Expected download error message, got: {resB.ErrorMessage}");
         Assert(wsB.Papers.Count == 0, "No corrupt papers should be created locally when asset pull fails.");
+    }
+
+    private static void S3ClientListObjectsChecks()
+    {
+        var s3Handler = new InMemoryS3Handler();
+        using var httpClient = new HttpClient(s3Handler);
+        var config = new S3Config
+        {
+            Endpoint = "http://127.0.0.1:9000",
+            Bucket = "papertodo",
+            Prefix = "sync/",
+            AccessKey = "ak",
+            SecretKey = "sk"
+        };
+        s3Handler.Storage["/papertodo/sync/v1/assets/hash1.bin"] = [1];
+        s3Handler.Storage["/papertodo/sync/v1/assets/hash2.bin"] = [2];
+        s3Handler.Storage["/papertodo/sync/v1/papers/p1.json"] = [3];
+
+        using var client = new S3Client(config, httpClient);
+        var assetKeys = client.ListObjectsAsync("sync/v1/assets/").GetAwaiter().GetResult();
+        Assert(assetKeys.Count == 2, $"Expected 2 asset keys, got: {assetKeys.Count}");
+        Assert(assetKeys.Contains("sync/v1/assets/hash1.bin"), "Missing hash1.bin");
+        Assert(assetKeys.Contains("sync/v1/assets/hash2.bin"), "Missing hash2.bin");
+    }
+
+    private static void OrphanAssetGarbageCollectionChecks()
+    {
+        var s3Handler = new InMemoryS3Handler();
+        using var httpClient = new HttpClient(s3Handler);
+        var config = new S3Config
+        {
+            Endpoint = "http://127.0.0.1:9000",
+            Bucket = "papertodo",
+            Prefix = "sync/",
+            AccessKey = "ak",
+            SecretKey = "sk"
+        };
+
+        var client = new S3Client(config, httpClient);
+        var engine = new SyncEngine(client, "sync/", "device-A", "PC-A");
+        var ws = new MockWorkspace();
+        var assets = new MockNoteAssets();
+
+        // 1. Create Note 1 with Image 1
+        var img1Bytes = new byte[] { 0x89, 0x50, 0x4E, 0x47, 1, 1, 1 };
+        var aImg1 = assets.ImportImage("note-1", "image/png", img1Bytes);
+        var hash1 = S3Signer.HashHex(img1Bytes);
+
+        ws.CreatePaper(new CreatePaperRequest
+        {
+            PaperId = "note-1",
+            Type = "note",
+            Title = "笔记一",
+            Content = $"![img1](i:{aImg1.ImageId})"
+        });
+
+        // Create Note 2 with Image 2
+        var img2Bytes = new byte[] { 0x89, 0x50, 0x4E, 0x47, 2, 2, 2 };
+        var aImg2 = assets.ImportImage("note-2", "image/png", img2Bytes);
+        var hash2 = S3Signer.HashHex(img2Bytes);
+
+        ws.CreatePaper(new CreatePaperRequest
+        {
+            PaperId = "note-2",
+            Type = "note",
+            Title = "笔记二",
+            Content = $"![img2](i:{aImg2.ImageId})"
+        });
+
+        var hashes = new Dictionary<string, string>();
+        var res1 = engine.ExecuteSyncAsync(ws, assets, 0, hashes).GetAwaiter().GetResult();
+        Assert(res1.Success && res1.PushedCount == 2, "Initial push failed.");
+
+        // Both images should exist on S3
+        var s3Img1Path = $"/papertodo/sync/v1/assets/{hash1}.bin";
+        var s3Img2Path = $"/papertodo/sync/v1/assets/{hash2}.bin";
+        Assert(s3Handler.Storage.ContainsKey(s3Img1Path), "Asset 1 must exist on S3.");
+        Assert(s3Handler.Storage.ContainsKey(s3Img2Path), "Asset 2 must exist on S3.");
+
+        // 2. Delete Note 1 locally
+        ws.DeletePaper("note-1");
+
+        // 3. Trigger sync: Note 1 is deleted, Note 2 is kept -> Auto GC should purge Image 1 from S3!
+        var res2 = engine.ExecuteSyncAsync(ws, assets, res1.NewRevision, hashes).GetAwaiter().GetResult();
+        Assert(res2.Success, $"Delete sync failed: {res2.ErrorMessage}");
+
+        // Asset 1 (orphaned) MUST be cleaned up from S3!
+        Assert(!s3Handler.Storage.ContainsKey(s3Img1Path), "Orphaned Asset 1 should be automatically GC-purged from S3!");
+
+        // Asset 2 (still referenced by Note 2) MUST be preserved!
+        Assert(s3Handler.Storage.ContainsKey(s3Img2Path), "Referenced Asset 2 must be preserved on S3!");
     }
 }

@@ -1,3 +1,4 @@
+using System.IO;
 using PaperTodo.Plugin;
 using PaperTodo.Plugin.MinioSync.Client;
 
@@ -276,6 +277,15 @@ public sealed class SyncEngine
                 await _s3Client.PutObjectAsync(manifestKey, newManifest.ToUtf8Bytes(), "application/json", ct).ConfigureAwait(false);
             }
 
+            // 6. If papers were deleted, perform safe Garbage Collection (GC) for orphan cloud assets
+            if (hasLocalDeletions)
+            {
+                var activeHashes = updatedSummaries.Values
+                    .SelectMany(p => p.ReferencedAssets)
+                    .ToHashSet(StringComparer.Ordinal);
+                await CleanupOrphanAssetsAsync(activeHashes, ct).ConfigureAwait(false);
+            }
+
             // Update known hashes tracking
             foreach (var (k, v) in currentLocalHashes)
             {
@@ -525,6 +535,38 @@ public sealed class SyncEngine
                 Content = adjustedContent,
                 Mode = NoteWriteMode.Replace
             });
+        }
+    }
+
+    private async Task CleanupOrphanAssetsAsync(
+        HashSet<string> activeAssetHashes,
+        CancellationToken ct)
+    {
+        try
+        {
+            var assetsPrefix = $"{_prefix}v1/assets/";
+            var allAssetKeys = await _s3Client.ListObjectsAsync(assetsPrefix, ct).ConfigureAwait(false);
+
+            foreach (var key in allAssetKeys)
+            {
+                var fileName = Path.GetFileName(key);
+                if (fileName.EndsWith(".bin", StringComparison.OrdinalIgnoreCase))
+                {
+                    var hash = fileName[..^4];
+                    if (!activeAssetHashes.Contains(hash))
+                    {
+                        try
+                        {
+                            await _s3Client.DeleteObjectAsync(key, ct).ConfigureAwait(false);
+                        }
+                        catch { }
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // Orphan cleanup failure must never break overall sync success
         }
     }
 }
