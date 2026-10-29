@@ -1,3 +1,5 @@
+using System.Windows;
+using System.Windows.Controls;
 using PaperTodo.Plugin;
 using PaperTodo.Plugin.MinioSync.Client;
 using PaperTodo.Plugin.MinioSync.Engine;
@@ -70,6 +72,16 @@ public sealed class MinioSyncRuntime : IPaperPluginRuntime
     {
         if (_disposed) return;
         _disposed = true;
+
+        // 退出时自动同步一次，并弹出等待提示（强制等待同步完成并对网络异常进行弹窗告警）
+        if (_settings.ToS3Config().IsValid && (_hasPendingChanges || _settings.AutoSync))
+        {
+            try
+            {
+                PerformExitSync();
+            }
+            catch { }
+        }
 
         try
         {
@@ -256,5 +268,143 @@ public sealed class MinioSyncRuntime : IPaperPluginRuntime
                 Priority = 90
             }
         ]);
+    }
+
+    private void PerformExitSync()
+    {
+        var config = _settings.ToS3Config();
+        if (!config.IsValid) return;
+
+        using var exitCts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+        var ct = exitCts.Token;
+
+        var window = new Window
+        {
+            Title = "MinIO 同步接力",
+            Width = 380,
+            Height = 175,
+            WindowStartupLocation = WindowStartupLocation.CenterScreen,
+            ResizeMode = ResizeMode.NoResize,
+            WindowStyle = WindowStyle.ToolWindow,
+            Topmost = true,
+            ShowInTaskbar = true,
+            Background = SystemColors.WindowBrush
+        };
+
+        var grid = new Grid { Margin = new Thickness(18) };
+        grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+        var titleText = new TextBlock
+        {
+            Text = "MinIO 正在同步，请稍候...",
+            FontWeight = FontWeights.Bold,
+            FontSize = 14,
+            Margin = new Thickness(0, 0, 0, 6)
+        };
+        Grid.SetRow(titleText, 0);
+
+        var descText = new TextBlock
+        {
+            Text = "正在将最新的便签与待办推送到云端，同步完成后将自动退出。",
+            TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(0, 0, 0, 12),
+            Foreground = SystemColors.GrayTextBrush,
+            FontSize = 12
+        };
+        Grid.SetRow(descText, 1);
+
+        var progressBar = new ProgressBar
+        {
+            IsIndeterminate = true,
+            Height = 4,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(0, 0, 0, 12)
+        };
+        Grid.SetRow(progressBar, 2);
+
+        var skipButton = new Button
+        {
+            Content = "跳过并退出",
+            Padding = new Thickness(10, 3, 10, 3),
+            HorizontalAlignment = HorizontalAlignment.Right,
+            FontSize = 12
+        };
+        skipButton.Click += (_, _) =>
+        {
+            try { exitCts.Cancel(); } catch { }
+            window.Close();
+        };
+        Grid.SetRow(skipButton, 3);
+
+        grid.Children.Add(titleText);
+        grid.Children.Add(descText);
+        grid.Children.Add(progressBar);
+        grid.Children.Add(skipButton);
+        window.Content = grid;
+
+        SyncResult? syncResult = null;
+        Exception? syncException = null;
+
+        window.Loaded += async (_, _) =>
+        {
+            try
+            {
+                syncResult = await Task.Run(async () =>
+                {
+                    using var client = new S3Client(config);
+                    var engine = new SyncEngine(client, config.NormalizedPrefix, _state.DeviceId, Environment.MachineName);
+                    var hashes = new Dictionary<string, string>(_state.KnownLocalHashes, StringComparer.Ordinal);
+                    var noteAssets = _context.NoteAssets;
+
+                    return await engine.ExecuteSyncAsync(
+                        _context.Workspace,
+                        noteAssets,
+                        _state.LastKnownRevision,
+                        hashes,
+                        ct).ConfigureAwait(false);
+                }, ct).ConfigureAwait(true);
+
+                if (syncResult != null && syncResult.Success)
+                {
+                    _state = _state with
+                    {
+                        LastSyncTime = DateTimeOffset.UtcNow,
+                        LastKnownRevision = syncResult.NewRevision > 0 ? syncResult.NewRevision : _state.LastKnownRevision
+                    };
+                    _context.State.Save(_state.ToJson());
+                }
+            }
+            catch (Exception ex)
+            {
+                syncException = ex;
+            }
+            finally
+            {
+                window.Close();
+            }
+        };
+
+        window.ShowDialog();
+
+        // 网络或服务异常报警提示
+        if (syncException != null && syncException is not OperationCanceledException)
+        {
+            MessageBox.Show(
+                $"MinIO 退出同步未成功完成：\n网络连接异常: {syncException.Message}\n\n当前本地修改可能尚未同步到云端，请在下次启动后检查网络与同步状态。",
+                "MinIO 同步提醒",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+        }
+        else if (syncResult != null && !syncResult.Success)
+        {
+            MessageBox.Show(
+                $"MinIO 退出同步失败：\n{syncResult.ErrorMessage}\n\n当前本地修改可能尚未同步到云端，请检查 S3/MinIO 配置与服务状态。",
+                "MinIO 同步提醒",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+        }
     }
 }
