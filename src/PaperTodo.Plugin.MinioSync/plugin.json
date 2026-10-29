@@ -92,6 +92,14 @@
       "category": "连接配置"
     },
     {
+      "id": "region",
+      "type": "string",
+      "name": "S3 区域 (Region)",
+      "description": "公有云如 AWS/阿里云 OSS/腾讯云 COS 需填写所在地域（如 us-east-1, oss-cn-hangzhou），自建 MinIO 保持默认 us-east-1 即可",
+      "default": "us-east-1",
+      "category": "连接配置"
+    },
+    {
       "id": "insecureSkipVerify",
       "type": "boolean",
       "name": "允许不安全 SSL (自签名证书)",

@@ -139,13 +139,13 @@ public sealed record PaperSyncData
         sb.Append(Type).Append('|').Append(Title).Append('|');
         if (Type == "todo")
         {
-            foreach (var todo in Todos.OrderBy(t => t.Order).ThenBy(t => t.Id, StringComparer.Ordinal))
+            foreach (var todo in Todos.OrderBy(t => t.Order).ThenBy(t => t.Text, StringComparer.Ordinal))
             {
-                sb.Append(todo.Id).Append(':')
-                  .Append(todo.Text).Append(':')
+                sb.Append(todo.Text).Append(':')
                   .Append(todo.Done ? '1' : '0').Append(':')
                   .Append(todo.Order).Append(':')
-                  .Append(todo.ReminderAt?.ToUnixTimeMilliseconds() ?? 0).Append(';');
+                  .Append(todo.ReminderAt?.ToUnixTimeMilliseconds() ?? 0).Append(':')
+                  .Append(todo.LinkedPaperId ?? "").Append(';');
             }
         }
         else

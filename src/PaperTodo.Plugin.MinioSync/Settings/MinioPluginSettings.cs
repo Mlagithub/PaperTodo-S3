@@ -21,6 +21,9 @@ public sealed record MinioPluginSettings
     [JsonPropertyName("secretKey")]
     public string SecretKey { get; init; } = "";
 
+    [JsonPropertyName("region")]
+    public string Region { get; init; } = "us-east-1";
+
     [JsonPropertyName("insecureSkipVerify")]
     public bool InsecureSkipVerify { get; init; } = false;
 
@@ -59,6 +62,7 @@ public sealed record MinioPluginSettings
         Prefix = Prefix,
         AccessKey = AccessKey,
         SecretKey = SecretKey,
+        Region = string.IsNullOrWhiteSpace(Region) ? "us-east-1" : Region.Trim(),
         InsecureSkipVerify = InsecureSkipVerify
     };
 }

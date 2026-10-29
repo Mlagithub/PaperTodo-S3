@@ -64,6 +64,8 @@ public sealed class SyncEngine
 
             // 2. Process Pull & Conflict Detection if remote manifest exists
             var targetManifestPapers = new Dictionary<string, PaperSummary>(StringComparer.Ordinal);
+            var safeToDeleteRemoteIds = new HashSet<string>(StringComparer.Ordinal);
+
             if (remoteManifest != null)
             {
                 foreach (var (remoteId, remoteSummary) in remoteManifest.Papers)
@@ -71,9 +73,25 @@ public sealed class SyncEngine
                     if (!currentLocalData.TryGetValue(remoteId, out var localData))
                     {
                         // Check if this paper was previously known and deleted locally
-                        if (knownLocalHashes.ContainsKey(remoteId))
+                        if (knownLocalHashes.TryGetValue(remoteId, out var lastKnownHash))
                         {
-                            // Local deletion: do not resurrect, push step will update remote manifest
+                            if (string.Equals(remoteSummary.ContentHash, lastKnownHash, StringComparison.Ordinal))
+                            {
+                                // Pure local deletion: remote has not changed since last sync
+                                safeToDeleteRemoteIds.Add(remoteId);
+                                continue;
+                            }
+
+                            // Concurrent modification on remote while deleted locally:
+                            // Do not silently delete remote data! Resurrect remote update as conflict copy locally
+                            var conflictPaperBytes = await _s3Client.GetObjectAsync($"{_prefix}v1/papers/{remoteId}.json", ct).ConfigureAwait(false);
+                            if (conflictPaperBytes != null && PaperSyncData.FromUtf8Bytes(conflictPaperBytes) is { } conflictData)
+                            {
+                                await ApplyRemotePaperAsync(workspace, noteAssets, conflictData, isConflict: true, ct).ConfigureAwait(false);
+                                conflictCount++;
+                            }
+                            // Keep remote paper intact in manifest so the other device's modification is preserved!
+                            targetManifestPapers[remoteId] = remoteSummary;
                             continue;
                         }
 
@@ -184,7 +202,7 @@ public sealed class SyncEngine
 
             // 4. Push local changes
             var updatedSummaries = new Dictionary<string, PaperSummary>(StringComparer.Ordinal);
-            var hasLocalDeletions = remoteManifest != null && remoteManifest.Papers.Keys.Any(k => !currentLocalData.ContainsKey(k));
+            var hasLocalDeletions = safeToDeleteRemoteIds.Count > 0;
 
             foreach (var (paperId, localData) in currentLocalData)
             {
@@ -218,20 +236,26 @@ public sealed class SyncEngine
                 };
             }
 
-            // Clean up S3 paper files for deleted papers
+            // Keep remote papers that were preserved during conflict/relay
             if (remoteManifest != null)
             {
-                foreach (var remoteId in remoteManifest.Papers.Keys)
+                foreach (var (remoteId, remoteSummary) in remoteManifest.Papers)
                 {
-                    if (!currentLocalData.ContainsKey(remoteId))
+                    if (!currentLocalData.ContainsKey(remoteId) && !safeToDeleteRemoteIds.Contains(remoteId))
                     {
-                        try
-                        {
-                            await _s3Client.DeleteObjectAsync($"{_prefix}v1/papers/{remoteId}.json", ct).ConfigureAwait(false);
-                        }
-                        catch { }
+                        updatedSummaries[remoteId] = remoteSummary;
                     }
                 }
+            }
+
+            // Clean up S3 paper files ONLY for verified deleted papers
+            foreach (var remoteId in safeToDeleteRemoteIds)
+            {
+                try
+                {
+                    await _s3Client.DeleteObjectAsync($"{_prefix}v1/papers/{remoteId}.json", ct).ConfigureAwait(false);
+                }
+                catch { }
             }
 
             // 5. Update remote manifest ONLY IF we actually pushed something, had deletions, or had conflicts to record
@@ -371,13 +395,19 @@ public sealed class SyncEngine
             {
                 try
                 {
-                    var newImage = noteAssets.ImportImage(targetPaperId, "image/png", assetBytes);
+                    var mime = ImageAssetSyncer.DetectMimeType(assetBytes);
+                    var newImage = noteAssets.ImportImage(targetPaperId, mime, assetBytes);
                     replacements[oldImageId] = newImage.ImageId;
                 }
-                catch
+                catch (Exception ex)
                 {
-                    // Keep original reference on import failure
+                    throw new InvalidOperationException($"Failed to import downloaded asset ({hash}) for note {targetPaperId}: {ex.Message}", ex);
                 }
+            }
+            else
+            {
+                // Asset download failed: abort updating this note to prevent wiping cloud asset hashes with a broken note!
+                throw new InvalidOperationException($"Asset with hash {hash} referenced by note {remoteData.Id} could not be downloaded from S3");
             }
         }
 
@@ -422,14 +452,27 @@ public sealed class SyncEngine
             var result = workspace.CreatePaper(req);
             var noteId = result.PaperId;
 
-            var adjustedContent = await ResolveRemoteNoteContentAsync(noteAssets, noteId, remoteData, ct).ConfigureAwait(false);
-
-            workspace.WriteNote(new WriteNoteRequest
+            try
             {
-                PaperId = noteId,
-                Content = adjustedContent,
-                Mode = NoteWriteMode.Replace
-            });
+                var adjustedContent = await ResolveRemoteNoteContentAsync(noteAssets, noteId, remoteData, ct).ConfigureAwait(false);
+
+                workspace.WriteNote(new WriteNoteRequest
+                {
+                    PaperId = noteId,
+                    Content = adjustedContent,
+                    Mode = NoteWriteMode.Replace
+                });
+            }
+            catch
+            {
+                // Rollback created paper on failure so workspace does not retain corrupt/incomplete notes
+                try
+                {
+                    workspace.DeletePaper(noteId);
+                }
+                catch { }
+                throw;
+            }
         }
     }
 

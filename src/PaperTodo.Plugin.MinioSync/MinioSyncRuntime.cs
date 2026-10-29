@@ -13,10 +13,13 @@ public sealed class MinioSyncRuntime : IPaperPluginRuntime
     private readonly IDisposable _workspaceSubscription;
     private readonly IDisposable _settingsSubscription;
     private readonly SemaphoreSlim _syncLock = new(1, 1);
+    private readonly CancellationTokenSource _cts = new();
     private readonly Timer _debounceTimer;
+    private readonly Timer _settingsDebounceTimer;
 
     private MinioPluginSettings _settings;
     private MinioPluginState _state;
+    private long _changeVersion;
     private bool _disposed;
     private bool _hasPendingChanges;
 
@@ -27,6 +30,7 @@ public sealed class MinioSyncRuntime : IPaperPluginRuntime
         _state = MinioPluginState.FromJson(context.State.Json);
 
         _debounceTimer = new Timer(OnDebounceElapsed, null, Timeout.Infinite, Timeout.Infinite);
+        _settingsDebounceTimer = new Timer(OnSettingsDebounceElapsed, null, Timeout.Infinite, Timeout.Infinite);
 
         MinioSyncPlugin.SyncTrigger = manual => TriggerSyncAsync(manual);
 
@@ -53,13 +57,13 @@ public sealed class MinioSyncRuntime : IPaperPluginRuntime
             OnWorkspaceEvent);
 
         // Startup pull check after short delay
-        Task.Delay(1500).ContinueWith(_ =>
+        Task.Delay(1500, _cts.Token).ContinueWith(t =>
         {
-            if (!_disposed && _settings.ToS3Config().IsValid)
+            if (!t.IsCanceled && !_disposed && _settings.ToS3Config().IsValid)
             {
                 _ = TriggerSyncAsync(manual: false);
             }
-        });
+        }, TaskScheduler.Default);
     }
 
     public void Dispose()
@@ -67,7 +71,14 @@ public sealed class MinioSyncRuntime : IPaperPluginRuntime
         if (_disposed) return;
         _disposed = true;
 
+        try
+        {
+            _cts.Cancel();
+        }
+        catch { }
+
         _debounceTimer.Dispose();
+        _settingsDebounceTimer.Dispose();
         _settingsSubscription.Dispose();
         _workspaceSubscription.Dispose();
 
@@ -75,17 +86,8 @@ public sealed class MinioSyncRuntime : IPaperPluginRuntime
         _context.GlobalTopBar.Clear();
         MinioSyncPlugin.SyncTrigger = null;
 
-        // If there are pending changes on exit, attempt a final quick sync
-        if (_hasPendingChanges && _settings.ToS3Config().IsValid)
-        {
-            try
-            {
-                TriggerSyncAsync(manual: false).Wait(TimeSpan.FromSeconds(3));
-            }
-            catch { }
-        }
-
         _syncLock.Dispose();
+        _cts.Dispose();
     }
 
     private void OnTopBarAction(PaperTopBarActionInvocation invocation)
@@ -102,6 +104,16 @@ public sealed class MinioSyncRuntime : IPaperPluginRuntime
         _settings = MinioPluginSettings.FromJson(json);
         if (_settings.ToS3Config().IsValid)
         {
+            // 1.5s debounce for settings input to avoid spamming errors while typing
+            _settingsDebounceTimer.Change(TimeSpan.FromMilliseconds(1500), Timeout.InfiniteTimeSpan);
+        }
+    }
+
+    private void OnSettingsDebounceElapsed(object? state)
+    {
+        if (_disposed) return;
+        if (_settings.ToS3Config().IsValid)
+        {
             _ = TriggerSyncAsync(manual: true);
         }
     }
@@ -110,6 +122,7 @@ public sealed class MinioSyncRuntime : IPaperPluginRuntime
     {
         if (_disposed || !_settings.AutoSync) return;
 
+        Interlocked.Increment(ref _changeVersion);
         _hasPendingChanges = true;
         // Reset debounce timer to 30 seconds
         _debounceTimer.Change(TimeSpan.FromSeconds(30), Timeout.InfiniteTimeSpan);
@@ -121,8 +134,10 @@ public sealed class MinioSyncRuntime : IPaperPluginRuntime
         _ = TriggerSyncAsync(manual: false);
     }
 
-    public async Task<SyncResult> TriggerSyncAsync(bool manual)
+    public async Task<SyncResult> TriggerSyncAsync(bool manual, CancellationToken externalCt = default)
     {
+        if (_disposed) return new SyncResult { Success = false, ErrorMessage = "Runtime disposed" };
+
         var config = _settings.ToS3Config();
         if (!config.IsValid)
         {
@@ -130,13 +145,17 @@ public sealed class MinioSyncRuntime : IPaperPluginRuntime
             return new SyncResult { Success = false, ErrorMessage = "MinIO config is invalid" };
         }
 
-        if (!await _syncLock.WaitAsync(0).ConfigureAwait(false))
+        if (!await _syncLock.WaitAsync(0, externalCt).ConfigureAwait(false))
         {
             // Already syncing
             return new SyncResult { Success = false, ErrorMessage = "Already syncing" };
         }
 
         UpdateTopBarStatus(isSyncing: true, statusText: "MinIO 正在同步...");
+
+        var capturedVersion = Interlocked.Read(ref _changeVersion);
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, externalCt);
+        var ct = linkedCts.Token;
 
         try
         {
@@ -150,11 +169,21 @@ public sealed class MinioSyncRuntime : IPaperPluginRuntime
                 _context.Workspace,
                 noteAssets,
                 _state.LastKnownRevision,
-                hashes).ConfigureAwait(false);
+                hashes,
+                ct).ConfigureAwait(false);
 
             if (result.Success)
             {
-                _hasPendingChanges = false;
+                if (Interlocked.Read(ref _changeVersion) == capturedVersion)
+                {
+                    _hasPendingChanges = false;
+                }
+                else
+                {
+                    _hasPendingChanges = true;
+                    _debounceTimer.Change(TimeSpan.FromSeconds(5), Timeout.InfiniteTimeSpan);
+                }
+
                 _state = _state with
                 {
                     LastSyncTime = DateTimeOffset.UtcNow,
@@ -188,6 +217,10 @@ public sealed class MinioSyncRuntime : IPaperPluginRuntime
             }
 
             return result;
+        }
+        catch (OperationCanceledException)
+        {
+            return new SyncResult { Success = false, ErrorMessage = "Sync canceled" };
         }
         catch (Exception ex)
         {

@@ -19,13 +19,17 @@ internal static class Program
         {
             ("s3-empty-payload-sha256", EmptyPayloadSha256),
             ("s3-signer-headers-and-format", SignerHeadersAndFormat),
+            ("s3-custom-region-signer", S3CustomRegionSignerChecks),
             ("s3-uri-builder-normalization", UriBuilderNormalization),
             ("s3-client-mock-operations", MockClientOperations),
             ("manifest-and-sync-data-hash-and-serialization", ManifestSerializationChecks),
             ("sync-engine-serial-relay-push-pull", SerialRelayPushPullChecks),
+            ("sync-engine-todo-push-pull-idle-hash", TodoPushPullIdleHashChecks),
             ("sync-engine-note-and-image-relay-push-pull", NoteAndImageSyncChecks),
             ("sync-engine-deletion-push-pull", DeletionPushPullChecks),
-            ("sync-engine-conflict-branch-isolation", ConflictBranchChecks)
+            ("sync-engine-delete-conflict-preservation", DeleteConflictPreservationChecks),
+            ("sync-engine-conflict-branch-isolation", ConflictBranchChecks),
+            ("asset-mime-detection-and-download-failure-abort", AssetMimeDetectionAndDownloadFailureAbortChecks)
         };
 
         var failed = 0;
@@ -629,5 +633,204 @@ internal static class Program
 
         var conflictPaper = wsB.Papers.First(p => p.Id != paperIdOnB);
         Assert(conflictPaper.Title.Contains("[冲突副本]"), $"Expected conflict copy title, got: {conflictPaper.Title}");
+    }
+
+    private static void S3CustomRegionSignerChecks()
+    {
+        var config = new S3Config
+        {
+            Endpoint = "https://oss-cn-hangzhou.aliyuncs.com",
+            Bucket = "mybucket",
+            AccessKey = "oss-ak",
+            SecretKey = "oss-sk",
+            Region = "oss-cn-hangzhou"
+        };
+
+        using var request = new HttpRequestMessage(HttpMethod.Get, "https://oss-cn-hangzhou.aliyuncs.com/mybucket/v1/manifest.json");
+        var fixedTime = new DateTimeOffset(2026, 4, 1, 10, 0, 0, TimeSpan.Zero);
+        S3Signer.Sign(request, config, payload: null, signingTime: fixedTime);
+
+        var auth = request.Headers.GetValues("Authorization").First();
+        Assert(auth.Contains("Credential=oss-ak/20260401/oss-cn-hangzhou/s3/aws4_request"),
+            $"Custom region credential scope mismatch: {auth}");
+    }
+
+    private static void TodoPushPullIdleHashChecks()
+    {
+        var s3Handler = new InMemoryS3Handler();
+        using var httpClient = new HttpClient(s3Handler);
+        var config = new S3Config
+        {
+            Endpoint = "http://127.0.0.1:9000",
+            Bucket = "papertodo",
+            Prefix = "sync/",
+            AccessKey = "ak",
+            SecretKey = "sk"
+        };
+
+        // 1. Device A creates todo paper with multiple items and pushes
+        var clientA = new S3Client(config, httpClient);
+        var engineA = new SyncEngine(clientA, "sync/", "device-A", "PC-A");
+        var wsA = new MockWorkspace();
+        wsA.CreatePaper(new CreatePaperRequest
+        {
+            PaperId = "todo-paper-1",
+            Type = "todo",
+            Title = "敏捷开发待办",
+            Todos =
+            [
+                new() { Text = "设计方案", Done = true },
+                new() { Text = "单元测试", Done = false },
+                new() { Text = "代码复审", Done = false }
+            ]
+        });
+
+        var hashesA = new Dictionary<string, string>();
+        var resA = engineA.ExecuteSyncAsync(wsA, null, 0, hashesA).GetAwaiter().GetResult();
+        Assert(resA.Success && resA.PushedCount == 1, "Device A push failed.");
+
+        // 2. Device B pulls the todo paper
+        var clientB = new S3Client(config, httpClient);
+        var engineB = new SyncEngine(clientB, "sync/", "device-B", "PC-B");
+        var wsB = new MockWorkspace();
+        var hashesB = new Dictionary<string, string>();
+
+        var resB = engineB.ExecuteSyncAsync(wsB, null, resA.NewRevision, hashesB).GetAwaiter().GetResult();
+        Assert(resB.Success && resB.PulledCount == 1, "Device B pull failed.");
+        Assert(wsB.Papers.Count == 1, "Device B should have 1 paper.");
+        Assert(wsB.Todos["todo-paper-1"].Count == 3, "Device B should have 3 todos.");
+
+        // 3. CRITICAL: Idle sync on Device B! Must have PushedCount == 0 and PulledCount == 0 (no ping-pong loop!)
+        var idleB = engineB.ExecuteSyncAsync(wsB, null, resB.NewRevision, hashesB).GetAwaiter().GetResult();
+        Assert(idleB.Success, "Device B idle sync failed.");
+        Assert(idleB.PushedCount == 0, $"Idle sync on B should push 0 papers, but pushed {idleB.PushedCount} (Ping-Pong bug detected!)");
+        Assert(idleB.PulledCount == 0, $"Idle sync on B should pull 0 papers, but pulled {idleB.PulledCount}");
+    }
+
+    private static void DeleteConflictPreservationChecks()
+    {
+        var s3Handler = new InMemoryS3Handler();
+        using var httpClient = new HttpClient(s3Handler);
+        var config = new S3Config
+        {
+            Endpoint = "http://127.0.0.1:9000",
+            Bucket = "papertodo",
+            Prefix = "sync/",
+            AccessKey = "ak",
+            SecretKey = "sk"
+        };
+
+        // 1. Initial paper created on Device A
+        var clientA = new S3Client(config, httpClient);
+        var engineA = new SyncEngine(clientA, "sync/", "device-A", "PC-A");
+        var wsA = new MockWorkspace();
+        wsA.CreatePaper(new CreatePaperRequest
+        {
+            PaperId = "important-note",
+            Type = "note",
+            Title = "绝密资料",
+            Content = "初版内容"
+        });
+        var hashesA = new Dictionary<string, string>();
+        var resA1 = engineA.ExecuteSyncAsync(wsA, null, 0, hashesA).GetAwaiter().GetResult();
+
+        // 2. Device B pulls initial version
+        var clientB = new S3Client(config, httpClient);
+        var engineB = new SyncEngine(clientB, "sync/", "device-B", "PC-B");
+        var wsB = new MockWorkspace();
+        var hashesB = new Dictionary<string, string>();
+        var resB1 = engineB.ExecuteSyncAsync(wsB, null, resA1.NewRevision, hashesB).GetAwaiter().GetResult();
+        Assert(wsB.Papers.Count == 1, "B initial pull failed.");
+
+        // 3. Device A updates note with important new findings and pushes
+        wsA.WriteNote(new WriteNoteRequest
+        {
+            PaperId = "important-note",
+            Content = "重大更新：极其关键的数据！"
+        });
+        var resA2 = engineA.ExecuteSyncAsync(wsA, null, resA1.NewRevision, hashesA).GetAwaiter().GetResult();
+        Assert(resA2.Success && resA2.PushedCount == 1, "A update push failed.");
+
+        // 4. Device B deletes 'important-note' locally without having pulled A's update
+        wsB.DeletePaper("important-note");
+        Assert(wsB.Papers.Count == 0, "B local deletion failed.");
+
+        // 5. Device B runs sync -> Must NOT silently delete A's update from cloud!
+        // Instead, B must detect the delete-update conflict and resurrect A's update as [冲突副本]!
+        var resB2 = engineB.ExecuteSyncAsync(wsB, null, resA2.NewRevision, hashesB).GetAwaiter().GetResult();
+        Assert(resB2.Success, $"B sync failed: {resB2.ErrorMessage}");
+        Assert(resB2.ConflictCount == 1, $"Expected 1 conflict detected on B, got {resB2.ConflictCount}");
+
+        // Verify Device B now has the conflict copy
+        Assert(wsB.Papers.Count == 1, $"B should have 1 resurrected conflict paper, got {wsB.Papers.Count}");
+        Assert(wsB.Papers[0].Title.Contains("[冲突副本]"), $"Title should be conflict copy, got: {wsB.Papers[0].Title}");
+        Assert(wsB.Notes[wsB.Papers[0].Id] == "重大更新：极其关键的数据！", "Resurrected content mismatch.");
+
+        // Verify the original paper file STILL exists in S3 (was not wiped out by B)
+        var s3Path = "/papertodo/sync/v1/papers/important-note.json";
+        Assert(s3Handler.Storage.ContainsKey(s3Path), "Cloud paper must NOT be deleted when remote has concurrent modifications!");
+    }
+
+    private static void AssetMimeDetectionAndDownloadFailureAbortChecks()
+    {
+        // 1. Magic number MIME detection
+        byte[] pngHeader = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0, 0];
+        Assert(ImageAssetSyncer.DetectMimeType(pngHeader) == "image/png", "PNG detection failed.");
+
+        byte[] jpegHeader = [0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10];
+        Assert(ImageAssetSyncer.DetectMimeType(jpegHeader) == "image/jpeg", "JPEG detection failed.");
+
+        byte[] gifHeader = Encoding.ASCII.GetBytes("GIF89a\x01\x00");
+        Assert(ImageAssetSyncer.DetectMimeType(gifHeader) == "image/gif", "GIF detection failed.");
+
+        byte[] webpHeader = [0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50];
+        Assert(ImageAssetSyncer.DetectMimeType(webpHeader) == "image/webp", "WebP detection failed.");
+
+        // 2. Download failure abort check
+        var s3Handler = new InMemoryS3Handler();
+        using var httpClient = new HttpClient(s3Handler);
+        var config = new S3Config
+        {
+            Endpoint = "http://127.0.0.1:9000",
+            Bucket = "papertodo",
+            Prefix = "sync/",
+            AccessKey = "ak",
+            SecretKey = "sk"
+        };
+
+        var clientA = new S3Client(config, httpClient);
+        var engineA = new SyncEngine(clientA, "sync/", "device-A", "PC-A");
+        var wsA = new MockWorkspace();
+        var assetsA = new MockNoteAssets();
+        var imgBytes = new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3 };
+        var aImg = assetsA.ImportImage("note-x", "image/png", imgBytes);
+        wsA.CreatePaper(new CreatePaperRequest
+        {
+            PaperId = "note-x",
+            Type = "note",
+            Title = "包含图片的笔记",
+            Content = $"![img](i:{aImg.ImageId})"
+        });
+        var hashesA = new Dictionary<string, string>();
+        var resA = engineA.ExecuteSyncAsync(wsA, assetsA, 0, hashesA).GetAwaiter().GetResult();
+        Assert(resA.Success, "Initial push failed.");
+
+        // Simulate S3 asset corruption or deletion (asset is missing from S3)
+        var hash = S3Signer.HashHex(imgBytes);
+        s3Handler.Storage.Remove($"/papertodo/sync/v1/assets/{hash}.bin");
+
+        // Device B tries to pull note-x whose image is missing
+        var clientB = new S3Client(config, httpClient);
+        var engineB = new SyncEngine(clientB, "sync/", "device-B", "PC-B");
+        var wsB = new MockWorkspace();
+        var assetsB = new MockNoteAssets();
+        var hashesB = new Dictionary<string, string>();
+
+        var resB = engineB.ExecuteSyncAsync(wsB, assetsB, resA.NewRevision, hashesB).GetAwaiter().GetResult();
+        // Must fail gracefully and NOT write broken half-baked note into local workspace!
+        Assert(!resB.Success, "Sync should fail when referenced asset is missing.");
+        Assert(resB.ErrorMessage != null && resB.ErrorMessage.Contains("could not be downloaded"),
+            $"Expected download error message, got: {resB.ErrorMessage}");
+        Assert(wsB.Papers.Count == 0, "No corrupt papers should be created locally when asset pull fails.");
     }
 }
