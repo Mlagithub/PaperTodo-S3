@@ -392,6 +392,12 @@ public sealed class MinioSyncRuntime : IPaperPluginRuntime
         // 网络或服务异常报警提示
         if (syncException != null && syncException is not OperationCanceledException)
         {
+            if (syncException.Message.Contains("session is no longer active", StringComparison.OrdinalIgnoreCase) ||
+                syncException.Message.Contains("PaperTodo is exiting", StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
             MessageBox.Show(
                 $"MinIO 退出同步未成功完成：\n网络连接异常: {syncException.Message}\n\n当前本地修改可能尚未同步到云端，请在下次启动后检查网络与同步状态。",
                 "MinIO 同步提醒",
@@ -400,6 +406,12 @@ public sealed class MinioSyncRuntime : IPaperPluginRuntime
         }
         else if (syncResult != null && !syncResult.Success)
         {
+            if (syncResult.ErrorMessage?.Contains("session is no longer active", StringComparison.OrdinalIgnoreCase) == true ||
+                syncResult.ErrorMessage?.Contains("PaperTodo is exiting", StringComparison.OrdinalIgnoreCase) == true)
+            {
+                return;
+            }
+
             MessageBox.Show(
                 $"MinIO 退出同步失败：\n{syncResult.ErrorMessage}\n\n当前本地修改可能尚未同步到云端，请检查 S3/MinIO 配置与服务状态。",
                 "MinIO 同步提醒",
