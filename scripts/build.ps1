@@ -6,7 +6,11 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $srcProject = Join-Path $root "src\PaperTodo.Plugin.MinioSync\PaperTodo.Plugin.MinioSync.csproj"
 $pluginJson = Join-Path $root "src\PaperTodo.Plugin.MinioSync\plugin.json"
-$out = Join-Path $root $OutputDir
+$out = if ([System.IO.Path]::IsPathRooted($OutputDir)) {
+    $OutputDir
+} else {
+    Join-Path $root $OutputDir
+}
 
 if (Test-Path $out) {
     Remove-Item -Path $out -Recurse -Force
