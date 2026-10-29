@@ -335,13 +335,18 @@ public sealed class SyncEngine
 
         if (paper.Type == "todo")
         {
-            var rawTodos = workspace.ListTodos(paper.Id, includeBlank: true);
+            var rawTodos = workspace.ListTodos(paper.Id, includeBlank: false);
             foreach (var t in rawTodos)
             {
+                if (string.IsNullOrWhiteSpace(t.Text))
+                {
+                    continue;
+                }
+
                 todos.Add(new TodoItemSyncData
                 {
                     Id = t.Id,
-                    Text = t.Text,
+                    Text = t.Text.Trim(),
                     Done = t.Done,
                     Order = t.Order,
                     ReminderAt = t.ReminderAt,
@@ -454,18 +459,22 @@ public sealed class SyncEngine
 
         if (remoteData.Type == "todo")
         {
+            var validTodos = remoteData.Todos
+                .Where(t => !string.IsNullOrWhiteSpace(t.Text))
+                .Select(t => new TodoCreateItem
+                {
+                    Text = t.Text.Trim(),
+                    Done = t.Done,
+                    ReminderAt = t.ReminderAt,
+                    LinkedPaperId = t.LinkedPaperId
+                }).ToArray();
+
             var req = new CreatePaperRequest
             {
                 PaperId = targetPaperId,
                 Type = "todo",
                 Title = title,
-                Todos = remoteData.Todos.Select(t => new TodoCreateItem
-                {
-                    Text = t.Text,
-                    Done = t.Done,
-                    ReminderAt = t.ReminderAt,
-                    LinkedPaperId = t.LinkedPaperId
-                }).ToArray()
+                Todos = validTodos.Length > 0 ? validTodos : null
             };
             workspace.CreatePaper(req);
         }
@@ -528,18 +537,22 @@ public sealed class SyncEngine
             }
 
             // Append remote todos
-            if (remoteData.Todos.Count > 0)
+            var validTodos = remoteData.Todos
+                .Where(t => !string.IsNullOrWhiteSpace(t.Text))
+                .Select(t => new TodoCreateItem
+                {
+                    Text = t.Text.Trim(),
+                    Done = t.Done,
+                    ReminderAt = t.ReminderAt,
+                    LinkedPaperId = t.LinkedPaperId
+                }).ToArray();
+
+            if (validTodos.Length > 0)
             {
                 workspace.AppendTodos(new AppendTodosRequest
                 {
                     PaperId = localData.Id,
-                    Todos = remoteData.Todos.Select(t => new TodoCreateItem
-                    {
-                        Text = t.Text,
-                        Done = t.Done,
-                        ReminderAt = t.ReminderAt,
-                        LinkedPaperId = t.LinkedPaperId
-                    }).ToArray()
+                    Todos = validTodos
                 });
             }
         }
