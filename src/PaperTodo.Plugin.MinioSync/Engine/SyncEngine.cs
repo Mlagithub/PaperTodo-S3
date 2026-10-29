@@ -58,6 +58,12 @@ public sealed class SyncEngine
 
             foreach (var paper in localPapers)
             {
+                // 排除本插件自身的控制台系统便签，防止将其误同步上云并引发自发冲突
+                if (string.Equals(paper.BodyProviderId, "com.papertodo.plugin.minio", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
                 var syncData = CapturePaperData(workspace, noteAssets, paper);
                 currentLocalData[paper.Id] = syncData;
                 currentLocalHashes[paper.Id] = syncData.ComputeContentHash();
@@ -187,6 +193,12 @@ public sealed class SyncEngine
             currentLocalHashes.Clear();
             foreach (var paper in localPapers)
             {
+                // 排除本插件自身的控制台系统便签，防止将其误同步上云并引发自发冲突
+                if (string.Equals(paper.BodyProviderId, "com.papertodo.plugin.minio", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
                 var syncData = CapturePaperData(workspace, noteAssets, paper);
                 currentLocalData[paper.Id] = syncData;
                 currentLocalHashes[paper.Id] = syncData.ComputeContentHash();
@@ -431,7 +443,13 @@ public sealed class SyncEngine
         bool isConflict,
         CancellationToken ct)
     {
-        var title = isConflict ? $"[冲突副本] {remoteData.Title}" : remoteData.Title;
+        var rawTitle = string.IsNullOrWhiteSpace(remoteData.Title) ? "未命名" : remoteData.Title;
+        var title = isConflict ? $"!{rawTitle}" : rawTitle;
+        // 严格遵循宿主 MaxTitleLength（默认 6 字符），防止创建便签时因标题过长被宿主拒绝
+        if (title.Length > 6)
+        {
+            title = title[..6];
+        }
         var targetPaperId = isConflict ? null : remoteData.Id;
 
         if (remoteData.Type == "todo")

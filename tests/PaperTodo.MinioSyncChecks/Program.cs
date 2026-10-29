@@ -665,7 +665,7 @@ internal static class Program
         Assert(wsB.Notes[localPaper.Id] == "B机本地写的内容", "Local content should remain unchanged!");
 
         var conflictPaper = wsB.Papers.First(p => p.Id != paperIdOnB);
-        Assert(conflictPaper.Title.Contains("[冲突副本]"), $"Expected conflict copy title, got: {conflictPaper.Title}");
+        Assert(conflictPaper.Title.StartsWith("!"), $"Expected conflict copy title prefix, got: {conflictPaper.Title}");
     }
 
     private static void S3CustomRegionSignerChecks()
@@ -796,7 +796,7 @@ internal static class Program
 
         // Verify Device B now has the conflict copy
         Assert(wsB.Papers.Count == 1, $"B should have 1 resurrected conflict paper, got {wsB.Papers.Count}");
-        Assert(wsB.Papers[0].Title.Contains("[冲突副本]"), $"Title should be conflict copy, got: {wsB.Papers[0].Title}");
+        Assert(wsB.Papers[0].Title.StartsWith("!"), $"Title should be conflict copy, got: {wsB.Papers[0].Title}");
         Assert(wsB.Notes[wsB.Papers[0].Id] == "重大更新：极其关键的数据！", "Resurrected content mismatch.");
 
         // Verify the original paper file STILL exists in S3 (was not wiped out by B)
